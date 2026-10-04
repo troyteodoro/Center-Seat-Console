@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+
+# Fails if a file that exists upstream differs from the tag in UPSTREAM_VERSION without a row in
+# docs/upstream-patches.md, or if a ledger row carries no diff (constitution Article V.5, AC-FS-006).
+# Reads the committed state of <ref> (default HEAD), so it checks what would be pushed.
+
+set -euo pipefail
+
+ref="${1:-HEAD}"
+ledger_path="docs/upstream-patches.md"
+
+if ! tag=$(git show "$ref:UPSTREAM_VERSION" 2>/dev/null | tr -d '[:space:]') || [[ -z "$tag" ]]; then
+    echo "Error: $ref has no UPSTREAM_VERSION."
+    exit 1
+fi
+
+if ! git rev-parse --verify -q "$tag^{commit}" >/dev/null; then
+    echo "Error: tag $tag from UPSTREAM_VERSION is not in this clone. Fetch it with:"
+    echo "  git fetch https://github.com/zed-industries/zed.git refs/tags/$tag:refs/tags/$tag"
+    exit 1
+fi
+
+if ! ledger=$(git show "$ref:$ledger_path" 2>/dev/null); then
+    echo "Error: $ref has no $ledger_path."
+    exit 1
+fi
+
+# A row is a "### `path`" heading under "## Patches". It carries a diff when a ```diff fence follows
+# before the next heading. Diff lines always start with a prefix character, so a fence inside a
+# patched Markdown file cannot be mistaken for one.
+ledger_rows=$(awk '
+    /^## / { in_patches = ($0 == "## Patches"); if (row != "") print row "\t" has_diff; row = ""; next }
+    !in_patches { next }
+    /^### `.+`$/ {
+        if (row != "") print row "\t" has_diff
+        row = substr($0, 6, length($0) - 6); has_diff = 0; next
+    }
+    /^```diff$/ { if (row != "") has_diff = 1 }
+    END { if (row != "") print row "\t" has_diff }
+' <<<"$ledger")
+
+listed_paths=$(cut -f1 <<<"$ledger_rows")
+rows_without_diff=$(awk -F'\t' '$2 == 0 { print $1 }' <<<"$ledger_rows")
+
+# Added files do not exist upstream, so only modified, deleted and type-changed files need a row.
+changed_upstream_files=$(git diff --name-only --no-renames --diff-filter=MDT "$tag" "$ref")
+
+unlisted_files=$(comm -23 <(sort -u <<<"$changed_upstream_files" | sed '/^$/d') \
+    <(sort -u <<<"$listed_paths" | sed '/^$/d'))
+
+failed=0
+
+if [[ -n "$unlisted_files" ]]; then
+    echo "Error: these upstream files differ from $tag but are not in $ledger_path:"
+    sed 's/^/  /' <<<"$unlisted_files"
+    failed=1
+fi
+
+if [[ -n "$rows_without_diff" ]]; then
+    echo "Error: these $ledger_path rows have no \`\`\`diff block:"
+    sed 's/^/  /' <<<"$rows_without_diff"
+    failed=1
+fi
+
+if [[ $failed -ne 0 ]]; then
+    exit 1
+fi
+
+echo "Ledger check passed: every upstream file changed since $tag is listed in $ledger_path."
