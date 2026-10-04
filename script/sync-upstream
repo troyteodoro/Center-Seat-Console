@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+
+# Usage: script/sync-upstream <tag>
+#
+# Merges a stable Zed tag into a new sync/<tag> branch cut from centerseat, bumps UPSTREAM_VERSION and
+# runs the checks (ADR 0011, AC-FS-002). It never touches centerseat itself; a human merges the result.
+#
+# Exit status: 0 synced and every check passed; 1 refused before merging; 2 merge conflict in a file
+# the fork changed, left in progress for resolution; 3 a check failed.
+
+set -euo pipefail
+
+upstream_url="${UPSTREAM_URL:-https://github.com/zed-industries/zed.git}"
+ledger_path="docs/upstream-patches.md"
+log_tail_lines=40
+
+refuse() {
+    echo "Error: $*"
+    exit 1
+}
+
+if [[ $# -ne 1 ]]; then
+    refuse "usage: script/sync-upstream <tag>"
+fi
+tag="$1"
+
+# Zed's stable tags are vX.Y.Z; previews carry a suffix such as -pre.
+version_pattern='^v([0-9]+)\.([0-9]+)\.([0-9]+)$'
+if [[ ! "$tag" =~ $version_pattern ]]; then
+    refuse "$tag is not a stable release tag (vX.Y.Z). Prerelease tags are never synced."
+fi
+new_version=("${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}")
+
+cd "$(git rev-parse --show-toplevel)"
+
+if ! git rev-parse --verify -q refs/heads/centerseat >/dev/null; then
+    refuse "there is no local centerseat branch."
+fi
+
+current_tag=$(git show centerseat:UPSTREAM_VERSION | tr -d '[:space:]')
+if [[ ! "$current_tag" =~ $version_pattern ]]; then
+    refuse "centerseat's UPSTREAM_VERSION holds '$current_tag', which is not a stable release tag."
+fi
+current_version=("${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}")
+
+is_newer=0
+for index in 0 1 2; do
+    if (( new_version[index] > current_version[index] )); then
+        is_newer=1
+        break
+    elif (( new_version[index] < current_version[index] )); then
+        break
+    fi
+done
+if [[ $is_newer -ne 1 ]]; then
+    refuse "$tag is not newer than centerseat's UPSTREAM_VERSION ($current_tag)."
+fi
+
+sync_branch="sync/$tag"
+if git rev-parse --verify -q "refs/heads/$sync_branch" >/dev/null; then
+    refuse "$sync_branch already exists. Delete it (git branch -D $sync_branch) to sync again."
+fi
+
+if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
+    refuse "the working tree has uncommitted changes."
+fi
+
+for needed_tag in "$current_tag" "$tag"; do
+    if ! git rev-parse --verify -q "refs/tags/$needed_tag" >/dev/null; then
+        echo "Fetching $needed_tag from $upstream_url"
+        if ! git fetch --no-tags "$upstream_url" "refs/tags/$needed_tag:refs/tags/$needed_tag"; then
+            refuse "could not fetch $needed_tag from $upstream_url."
+        fi
+    fi
+done
+
+git switch -c "$sync_branch" centerseat
+
+echo "Merging $tag into $sync_branch"
+if ! git merge --no-ff --no-edit -m "Merge Zed $tag into centerseat" "$tag"; then
+    conflicted_files=$(git diff --name-only --diff-filter=U)
+    if [[ -z "$conflicted_files" ]]; then
+        echo "Error: merging $tag failed without conflicts; see git's output above."
+        exit 2
+    fi
+
+    # Zed cuts each stable tag on its own release branch and cherry-picks fixes onto it, so successive
+    # tags conflict in files the fork never touched. When centerseat's copy still matches the old tag,
+    # the fork has no change to keep and the new tag's version is the correct result.
+    resolved_files=""
+    fork_conflicted_files=""
+    while IFS= read -r path; do
+        old_blob=$(git rev-parse -q --verify "$current_tag:$path" || true)
+        fork_blob=$(git rev-parse -q --verify "centerseat:$path" || true)
+        if [[ "$old_blob" == "$fork_blob" ]]; then
+            if git rev-parse -q --verify "$tag:$path" >/dev/null; then
+                git checkout "$tag" -- "$path"
+            else
+                git rm -q -- "$path"
+            fi
+            resolved_files+="$path"$'\n'
+        else
+            fork_conflicted_files+="$path"$'\n'
+        fi
+    done <<<"$conflicted_files"
+
+    if [[ -n "$resolved_files" ]]; then
+        echo
+        echo "Resolved to $tag, since the fork has not changed them since $current_tag:"
+        printf '%s' "$resolved_files" | sed 's/^/  /'
+    fi
+
+    if [[ -n "$fork_conflicted_files" ]]; then
+        ledgered_paths=$(git show "centerseat:$ledger_path" 2>/dev/null | awk '
+            /^## / { in_patches = ($0 == "## Patches"); next }
+            in_patches && /^### `.+`$/ { print substr($0, 6, length($0) - 6) }
+        ' || true)
+
+        echo
+        echo "Error: merging $tag into $sync_branch conflicts in these files the fork changed:"
+        while IFS= read -r path; do
+            if grep -qxF -- "$path" <<<"$ledgered_paths"; then
+                echo "  $path (ledgered)"
+            else
+                echo "  $path (unledgered)"
+            fi
+        done < <(printf '%s' "$fork_conflicted_files")
+        echo
+        echo "The merge is left in progress on $sync_branch. Resolve it, or run: git merge --abort"
+        exit 2
+    fi
+
+    git commit -q --no-edit
+fi
+
+printf '%s\n' "$tag" > UPSTREAM_VERSION
+git add UPSTREAM_VERSION
+git commit -q -m "Bump UPSTREAM_VERSION to $tag"
+
+log_dir=$(mktemp -d)
+
+run_check() {
+    local name="$1"
+    shift
+    local log_file="$log_dir/${name//[^A-Za-z0-9]/-}.log"
+    echo "Running $name"
+    if ! "$@" >"$log_file" 2>&1; then
+        echo
+        echo "Error: $name failed after merging $tag. Last $log_tail_lines lines of its log:"
+        tail -n "$log_tail_lines" "$log_file" | sed 's/^/  /'
+        echo
+        echo "Full log: $log_file"
+        exit 3
+    fi
+}
+
+run_check "cargo check" "${CARGO:-cargo}" check --workspace
+run_check "script/check-ledger" script/check-ledger HEAD
+
+# The branding check arrives with Spec 002 T205; until then there is nothing to run.
+if [[ -x script/check-branding ]]; then
+    run_check "script/check-branding" script/check-branding
+else
+    echo "Skipping branding check: script/check-branding does not exist yet."
+fi
+
+echo
+echo "Synced $tag into $sync_branch, and every check passed. Review and merge it into centerseat."
