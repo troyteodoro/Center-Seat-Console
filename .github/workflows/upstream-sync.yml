@@ -1,0 +1,201 @@
+# Merges the newest stable Zed release into a sync/<tag> branch and opens one PR per tag, or one
+# upstream-sync issue per tag when the merge or a check fails. It never merges into centerseat.
+name: Upstream sync
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+    inputs:
+      base:
+        description: Branch to sync from. Its UPSTREAM_VERSION is the current pin.
+        type: string
+        default: centerseat
+      dry_run:
+        description: Run the sync and its checks, but push nothing and open no PR or issue.
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: upstream-sync-${{ inputs.base || 'centerseat' }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      BASE: ${{ inputs.base || 'centerseat' }}
+      DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
+      GH_TOKEN: ${{ github.token }}
+      CC: clang
+      CXX: clang++
+    steps:
+      - name: Check out the base branch
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          ref: ${{ env.BASE }}
+          fetch-depth: 0
+
+      - name: Find the latest stable Zed release
+        id: release
+        run: |
+          tag=$(gh api repos/zed-industries/zed/releases/latest --jq .tag_name)
+          current=$(tr -d '[:space:]' < UPSTREAM_VERSION)
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+          if [[ "$tag" == "$current" ]]; then
+            echo "$BASE is already at Zed's latest stable release, $tag." | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "run=none" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          open_prs=$(gh pr list --head "sync/$tag" --base "$BASE" --state open --json number --jq length)
+          if [[ "$open_prs" -gt 0 ]]; then
+            echo "A pull request for sync/$tag is already open; leaving it for review." | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "run=none" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Syncing $BASE from $current to $tag (dry run: $DRY_RUN)." | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "run=sync" >> "$GITHUB_OUTPUT"
+
+      - name: Free disk space
+        if: steps.release.outputs.run == 'sync'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      # Split restore and save so the cache is kept even when the sync fails, which fails the job.
+      - name: Restore the cargo cache
+        if: steps.release.outputs.run == 'sync'
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            ~/.rustup
+          key: upstream-sync-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: upstream-sync-${{ runner.os }}-
+
+      - name: Install Linux dependencies
+        if: steps.release.outputs.run == 'sync'
+        run: ./script/linux
+
+      - name: Download the WASI SDK
+        if: steps.release.outputs.run == 'sync'
+        run: ./script/download-wasi-sdk
+
+      - name: Run script/sync-upstream
+        if: steps.release.outputs.run == 'sync'
+        id: sync
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # script/sync-upstream always branches from a local centerseat.
+          git switch -C centerseat
+
+          set +e
+          script/sync-upstream "$TAG" 2>&1 | tee "$RUNNER_TEMP/sync.log"
+          status=${PIPESTATUS[0]}
+          set -e
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+
+      - name: Save the cargo cache
+        if: always() && steps.release.outputs.run == 'sync' && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            ~/.rustup
+          key: upstream-sync-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+
+      - name: Write the report
+        if: always() && steps.sync.outputs.status != ''
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+          STATUS: ${{ steps.sync.outputs.status }}
+        run: |
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          log="$RUNNER_TEMP/sync.log"
+          report="$RUNNER_TEMP/report.md"
+
+          case "$STATUS" in
+            0) summary="Zed $TAG merged cleanly into \`sync/$TAG\`, and every check passed." ;;
+            1) summary="\`script/sync-upstream\` refused to sync Zed $TAG." ;;
+            2) summary="Merging Zed $TAG conflicts in files the fork changed." ;;
+            3) summary="Zed $TAG merged, but a check failed." ;;
+            *) summary="\`script/sync-upstream\` exited with status $STATUS." ;;
+          esac
+
+          # The script's own report starts at its first "Resolved to" or "Error:" line.
+          details=$(sed -nE '/^(Resolved to|Error:)/,$p' "$log" | tail -c 60000)
+          if [[ -z "$details" ]]; then
+            details=$(tail -n 60 "$log")
+          fi
+
+          {
+            echo "$summary"
+            echo
+            echo '```'
+            echo "$details"
+            echo '```'
+            echo
+            if [[ "$STATUS" == 0 ]]; then
+              echo "This pull request is never merged automatically. Review it and merge it into \`$BASE\` by hand."
+              echo
+            fi
+            echo "Base: \`$BASE\` · Run: $run_url"
+          } > "$report"
+
+          cat "$report" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$DRY_RUN" == true ]]; then
+            if [[ "$STATUS" == 0 ]]; then
+              echo "Dry run: would push sync/$TAG and open a pull request into $BASE with this body:"
+            else
+              echo "Dry run: would open or update the upstream-sync issue for $TAG with this body:"
+            fi
+            cat "$report"
+          fi
+
+      - name: Open the pull request
+        if: steps.sync.outputs.status == '0' && env.DRY_RUN != 'true'
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          # No pull request for this tag is open, so any existing sync/<tag> branch is stale.
+          git push --force origin "sync/$TAG"
+          gh pr create --base "$BASE" --head "sync/$TAG" --title "Sync Zed $TAG" \
+            --body-file "$RUNNER_TEMP/report.md"
+
+      - name: Open or update the issue
+        if: always() && steps.sync.outputs.status != '' && steps.sync.outputs.status != '0' && env.DRY_RUN != 'true'
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          title="Upstream sync failed: Zed $TAG"
+          gh label create upstream-sync --color D93F0B --description "Upstream Zed sync failures" --force
+          number=$(gh issue list --label upstream-sync --state open --limit 100 --json number,title \
+            | jq -r --arg title "$title" '.[] | select(.title == $title) | .number' | head -n 1)
+          if [[ -n "$number" ]]; then
+            gh issue edit "$number" --body-file "$RUNNER_TEMP/report.md"
+          else
+            gh issue create --title "$title" --label upstream-sync --body-file "$RUNNER_TEMP/report.md"
+          fi
+
+      - name: Fail when the sync failed
+        if: always() && steps.release.outputs.run == 'sync' && steps.sync.outputs.status != '0'
+        run: |
+          echo "script/sync-upstream did not succeed; see the report above."
+          exit 1
