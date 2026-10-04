@@ -40,7 +40,7 @@ jobs:
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
           ref: ${{ env.BASE }}
-          fetch-depth: 0
+          fetch-depth: 1
 
       - name: Find the latest stable Zed release
         id: release
@@ -64,6 +64,37 @@ jobs:
 
           echo "Syncing $BASE from $current to $tag (dry run: $DRY_RUN)." | tee -a "$GITHUB_STEP_SUMMARY"
           echo "run=sync" >> "$GITHUB_OUTPUT"
+
+      # The merge needs the commit where the base and the new tag split, which is usually a few hundred
+      # commits back. Fetching only that far keeps the runner from downloading Zed's full history.
+      - name: Fetch history back to the merge base
+        if: steps.release.outputs.run == 'sync'
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+          UPSTREAM_URL: https://github.com/zed-industries/zed.git
+          STEP: 300
+        run: |
+          current=$(tr -d '[:space:]' < UPSTREAM_VERSION)
+          base_refspec="+refs/heads/$BASE:refs/remotes/origin/$BASE"
+          tag_refspec="+refs/tags/$TAG:refs/tags/$TAG"
+
+          git fetch --no-tags --depth=1 "$UPSTREAM_URL" "+refs/tags/$current:refs/tags/$current"
+          git fetch --no-tags --depth="$STEP" origin "$base_refspec"
+          git fetch --no-tags --depth="$STEP" "$UPSTREAM_URL" "$tag_refspec"
+
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            if merge_base=$(git merge-base HEAD "$TAG"); then
+              echo "Found the merge base $merge_base after $attempt fetch(es) of $STEP commits."
+              exit 0
+            fi
+            git fetch --no-tags --deepen="$STEP" origin "$base_refspec"
+            git fetch --no-tags --deepen="$STEP" "$UPSTREAM_URL" "$tag_refspec"
+          done
+
+          echo "No merge base within $((STEP * 10)) commits; fetching the full history instead."
+          git fetch --no-tags --depth=2147483647 origin "$base_refspec"
+          git fetch --no-tags --depth=2147483647 "$UPSTREAM_URL" "$tag_refspec"
+          git merge-base HEAD "$TAG"
 
       - name: Free disk space
         if: steps.release.outputs.run == 'sync'
