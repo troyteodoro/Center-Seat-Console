@@ -1,0 +1,5 @@
+{"type":"initialize","protocol_version":1,"repo_path":"/Users/example/drydock-api"}
+{"type":"files_changed","paths":["api/auth/session.rs","ops/deploy/vault.tf"]}
+{"type":"room_state","path":"api/auth/session.rs","state":{"git":"modified","diagnostics":{"errors":1,"warnings":2},"tests":"failing"}}
+{"type":"error","code":"unsupported_protocol_version","message":"protocol_version 2 is not supported; this drydock speaks 1"}
+{"type":"shutdown"}

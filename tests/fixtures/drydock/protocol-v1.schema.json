@@ -1,0 +1,205 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/troyteodoro/Center-Seat-Console/tests/fixtures/drydock/protocol-v1.schema.json",
+  "title": "Dry Dock protocol v1 message",
+  "description": "One line of the JSON Lines stream between Center Seat Console and drydock. Frozen at v1; a change bumps protocol_version. Described in docs/drydock-protocol.md.",
+  "oneOf": [
+    { "$ref": "#/$defs/initialize" },
+    { "$ref": "#/$defs/ship" },
+    { "$ref": "#/$defs/files_changed" },
+    { "$ref": "#/$defs/transition" },
+    { "$ref": "#/$defs/room_state" },
+    { "$ref": "#/$defs/shutdown" },
+    { "$ref": "#/$defs/error" }
+  ],
+  "$defs": {
+    "initialize": {
+      "description": "Fork to drydock: the repository to read. The first message.",
+      "type": "object",
+      "properties": {
+        "type": { "const": "initialize" },
+        "protocol_version": { "const": 1 },
+        "repo_path": { "type": "string", "minLength": 1 }
+      },
+      "required": ["type", "protocol_version", "repo_path"],
+      "additionalProperties": false
+    },
+    "ship": {
+      "description": "Drydock to fork: the whole ship, in reply to initialize.",
+      "type": "object",
+      "properties": {
+        "type": { "const": "ship" },
+        "protocol_version": { "const": 1 },
+        "seed": { "type": "string", "pattern": "^[0-9a-f]{16}$" },
+        "plates": { "type": "array", "items": { "$ref": "#/$defs/plate" } },
+        "rooms": { "type": "array", "items": { "$ref": "#/$defs/room" } },
+        "frames": { "type": "array", "items": { "$ref": "#/$defs/frame" } }
+      },
+      "required": ["type", "protocol_version", "seed", "plates", "rooms", "frames"],
+      "additionalProperties": false
+    },
+    "files_changed": {
+      "description": "Fork to drydock: paths the editor's watcher saw change.",
+      "type": "object",
+      "properties": {
+        "type": { "const": "files_changed" },
+        "paths": { "type": "array", "items": { "$ref": "#/$defs/path" } }
+      },
+      "required": ["type", "paths"],
+      "additionalProperties": false
+    },
+    "transition": {
+      "description": "Drydock to fork: the rooms an edit moved, in reply to files_changed.",
+      "type": "object",
+      "properties": {
+        "type": { "const": "transition" },
+        "rooms": { "type": "array", "items": { "$ref": "#/$defs/room_change" } }
+      },
+      "required": ["type", "rooms"],
+      "additionalProperties": false
+    },
+    "room_state": {
+      "description": "Fork to drydock: a room's paint-tier state. Never moves geometry.",
+      "type": "object",
+      "properties": {
+        "type": { "const": "room_state" },
+        "path": { "$ref": "#/$defs/path" },
+        "state": { "$ref": "#/$defs/paint_state" }
+      },
+      "required": ["type", "path", "state"],
+      "additionalProperties": false
+    },
+    "shutdown": {
+      "description": "Fork to drydock: the last message.",
+      "type": "object",
+      "properties": {
+        "type": { "const": "shutdown" }
+      },
+      "required": ["type"],
+      "additionalProperties": false
+    },
+    "error": {
+      "description": "Drydock to fork: a message was refused.",
+      "type": "object",
+      "properties": {
+        "type": { "const": "error" },
+        "code": { "enum": ["unsupported_protocol_version", "malformed_message"] },
+        "message": { "type": "string" }
+      },
+      "required": ["type", "code", "message"],
+      "additionalProperties": false
+    },
+    "path": {
+      "description": "A file path relative to the repository root, '/'-separated. A room's identity.",
+      "type": "string",
+      "minLength": 1
+    },
+    "tile_box": {
+      "description": "Tiles [x0,x1) x [y0,y1) x [z0,z1) in unrotated world space, integer tile units. Non-empty: x0 < x1, y0 < y1, z0 < z1.",
+      "type": "object",
+      "properties": {
+        "x0": { "type": "integer" },
+        "y0": { "type": "integer" },
+        "z0": { "type": "integer" },
+        "x1": { "type": "integer" },
+        "y1": { "type": "integer" },
+        "z1": { "type": "integer" }
+      },
+      "required": ["x0", "y0", "z0", "x1", "y1", "z1"],
+      "additionalProperties": false
+    },
+    "plate_key": {
+      "description": "A plate's identity: its section directory and its deck within the section.",
+      "type": "object",
+      "properties": {
+        "section": { "type": "string" },
+        "deck": { "type": "integer", "minimum": 0 }
+      },
+      "required": ["section", "deck"],
+      "additionalProperties": false
+    },
+    "plate": {
+      "type": "object",
+      "properties": {
+        "section": { "type": "string" },
+        "deck": { "type": "integer", "minimum": 0 },
+        "layer": { "type": "integer", "minimum": 0 },
+        "box": { "$ref": "#/$defs/tile_box" }
+      },
+      "required": ["section", "deck", "layer", "box"],
+      "additionalProperties": false
+    },
+    "room": {
+      "description": "One file. Owns every tile of box except those in holes.",
+      "type": "object",
+      "properties": {
+        "path": { "$ref": "#/$defs/path" },
+        "plate": { "$ref": "#/$defs/plate_key" },
+        "box": { "$ref": "#/$defs/tile_box" },
+        "holes": {
+          "description": "Boxes inside box that this room does not own: sorted, disjoint, and left out when the room fills its box.",
+          "type": "array",
+          "items": { "$ref": "#/$defs/tile_box" },
+          "minItems": 1
+        }
+      },
+      "required": ["path", "plate", "box"],
+      "additionalProperties": false
+    },
+    "frame": {
+      "description": "A hull frame drawn around the plates. Never moves, clips or occludes a room.",
+      "type": "object",
+      "properties": {
+        "hull": { "enum": ["block", "cruiser", "saucer", "ring_station", "spine_and_pods"] },
+        "boxes": { "type": "array", "items": { "$ref": "#/$defs/tile_box" } }
+      },
+      "required": ["hull", "boxes"],
+      "additionalProperties": false
+    },
+    "placement": {
+      "type": "object",
+      "properties": {
+        "plate": { "$ref": "#/$defs/plate_key" },
+        "box": { "$ref": "#/$defs/tile_box" },
+        "holes": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/tile_box" },
+          "minItems": 1
+        }
+      },
+      "required": ["plate", "box"],
+      "additionalProperties": false
+    },
+    "room_change": {
+      "description": "One room an edit moved. before is null for a new room; after is null for a removed one; never both.",
+      "type": "object",
+      "properties": {
+        "path": { "$ref": "#/$defs/path" },
+        "before": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/placement" }] },
+        "after": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/placement" }] }
+      },
+      "required": ["path", "before", "after"],
+      "additionalProperties": false
+    },
+    "paint_state": {
+      "type": "object",
+      "properties": {
+        "git": {
+          "enum": ["clean", "modified", "added", "deleted", "renamed", "untracked", "ignored", "conflicted"]
+        },
+        "diagnostics": {
+          "type": "object",
+          "properties": {
+            "errors": { "type": "integer", "minimum": 0 },
+            "warnings": { "type": "integer", "minimum": 0 }
+          },
+          "required": ["errors", "warnings"],
+          "additionalProperties": false
+        },
+        "tests": { "enum": ["unknown", "passing", "failing"] }
+      },
+      "required": ["git", "diagnostics", "tests"],
+      "additionalProperties": false
+    }
+  }
+}
